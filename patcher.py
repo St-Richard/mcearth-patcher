@@ -5,7 +5,6 @@ Patches Minecraft Earth APK to use community servers.
 """
 
 import argparse
-import os
 import re
 import shutil
 import struct
@@ -15,6 +14,7 @@ import zipfile
 from pathlib import Path
 
 import requests
+from patch import fromstring
 
 PATCHES_URL = "https://github.com/Project-Earth-Team/Patches/archive/main.zip"
 DEFAULT_SERVER = "https://p.projectearth.dev"
@@ -22,6 +22,8 @@ SERVER_MAX = 27
 SUNSET_OFF = 0x22A6DC8
 SUNSET_VAL = 0x540005CB
 ADDR_OFF = 0x0514D05D
+
+KNOWN_GOOD_CODES = {2020121703}
 
 
 def bail(msg):
@@ -31,7 +33,58 @@ def bail(msg):
 
 def need(cmd):
     if shutil.which(cmd) is None:
-        bail(f"'{cmd}' not found — install it first")
+        return False
+    return True
+
+
+def fmt_size(n):
+    for unit in ("", "K", "M"):
+        if n < 1024:
+            return f"{n:.1f}{unit}"
+        n /= 1024
+    return f"{n:.1f}G"
+
+
+def validate_apk(apk: Path):
+    print("validating apk...")
+    size = apk.stat().st_size
+    print(f"  size: {fmt_size(size)}")
+
+    with zipfile.ZipFile(apk) as zf:
+        names = set(zf.namelist())
+
+    if "lib/arm64-v8a/libgenoa.so" not in names:
+        bail("APK doesn't contain lib/arm64-v8a/libgenoa.so — not Minecraft Earth")
+
+    # Try to extract version code from binary AndroidManifest
+    # Search for known version codes as raw 4-byte LE ints anywhere in the file
+    try:
+        with zipfile.ZipFile(apk) as zf:
+            raw = zf.read("AndroidManifest.xml")
+        known_le = {struct.pack("<I", v) for v in KNOWN_GOOD_CODES}
+        found = None
+        for i in range(len(raw) - 3):
+            chunk = raw[i : i + 4]
+            if chunk in known_le:
+                v = struct.unpack("<I", chunk)[0]
+                found = v
+                break
+            # Also try as big-endian
+            if chunk[::-1] in known_le:
+                v = struct.unpack(">I", chunk)[0]
+                found = v
+                break
+        if found:
+            print(f"  version code: {found}")
+            if found not in KNOWN_GOOD_CODES:
+                print(
+                    f"  warning: version code {found} not in known"
+                    f" compatible set {sorted(KNOWN_GOOD_CODES)}"
+                )
+        else:
+            print("  warning: could not determine version code from AndroidManifest")
+    except KeyError:
+        print("  warning: AndroidManifest.xml not found in APK")
 
 
 def download_patches(patch_dir: Path):
@@ -59,6 +112,9 @@ def download_patches(patch_dir: Path):
                 extracted.parent.rmdir()
     tmp.unlink()
 
+    count = len(list(patch_dir.glob("*.patch")))
+    print(f"  {count} patch files downloaded")
+
 
 def decompile(apk: Path, out: Path):
     print("decompiling apk...")
@@ -68,7 +124,6 @@ def decompile(apk: Path, out: Path):
 
 
 def normalize_line_endings(root: Path, rel_path: str):
-    """Rewrite a file with LF line endings (mirrors AndroidUtils.normalizeFile)."""
     f = root / rel_path
     if not f.exists():
         return
@@ -81,7 +136,7 @@ def patch_binary(out_dir: Path, server: str):
     print("patching libgenoa.so...")
     so = out_dir / "lib" / "arm64-v8a" / "libgenoa.so"
     if not so.exists():
-        bail(f"{so} not found — wrong apk?")
+        bail(f"{so} not found — decompile may have failed")
 
     if not re.match(r"^https?://", server):
         server = "https://" + server
@@ -91,10 +146,12 @@ def patch_binary(out_dir: Path, server: str):
     padded = server.ljust(SERVER_MAX, "\0").encode("ascii")
 
     data = so.read_bytes()
-    # Server address
     data = data[:ADDR_OFF] + padded + data[ADDR_OFF + len(padded) :]
-    # Sunset check
-    data = data[:SUNSET_OFF] + struct.pack("<I", SUNSET_VAL) + data[SUNSET_OFF + 4 :]
+    data = (
+        data[:SUNSET_OFF]
+        + struct.pack("<I", SUNSET_VAL)
+        + data[SUNSET_OFF + 4 :]
+    )
     so.write_bytes(data)
 
 
@@ -102,44 +159,28 @@ def apply_patches(out_dir: Path, patch_dir: Path):
     print("applying patches...")
     patches = sorted(patch_dir.glob("*.patch"))
     if not patches:
+        print("  no patches to apply")
         return
-    # Init a temporary git repo so git apply works
-    subprocess.run(["git", "init"], cwd=out_dir, check=True, capture_output=True)
-    subprocess.run(
-        ["git", "-c", "user.name=p", "-c", "user.email=p@p", "config", "user.email", "p@p"],
-        cwd=out_dir, check=True, capture_output=True,
-    )
-    subprocess.run(
-        ["git", "-c", "user.name=p", "-c", "user.email=p@p", "config", "user.name", "p"],
-        cwd=out_dir, check=True, capture_output=True,
-    )
 
     for pf in patches:
-        # Normalize line endings of target files before applying (matches original behaviour)
-        p = PatchFile(pf)
-        for fpath in p.target_files():
-            normalize_line_endings(out_dir, fpath)
-        subprocess.run(
-            ["git", "apply", "--whitespace=nowarn", str(pf)],
-            cwd=out_dir, check=True,
-        )
+        content = pf.read_bytes()
+        # Normalize CRLF -> LF in the patch content itself
+        content = content.replace(b"\r\n", b"\n").replace(b"\r", b"\n")
+
+        ps = fromstring(content)
+        if ps is None:
+            bail(f"failed to parse patch: {pf.name}")
+
+        # Normalize line endings of target files before patching
+        for item in ps.items:
+            # item.target is like b'b/smali/foo.smali' — strip b/ prefix
+            target_path = item.target.decode()
+            target_path = re.sub(r"^[ab]/", "", target_path)
+            normalize_line_endings(out_dir, target_path)
+
+        if not ps.apply(root=str(out_dir), strip=1):
+            bail(f"failed to apply patch: {pf.name}")
         print(f"  {pf.name}")
-
-
-class PatchFile:
-    """Minimal .patch parser to extract target file paths."""
-    def __init__(self, path: Path):
-        self.path = path
-        self._targets = []
-        with open(path) as f:
-            for line in f:
-                line = line.rstrip("\n\r")
-                m = re.match(r"^--- (?:a/)?(.+?)(?:\t.*)?$", line)
-                if m:
-                    self._targets.append(m.group(1))
-
-    def target_files(self):
-        return self._targets
 
 
 def recompile(out_dir: Path, output: Path):
@@ -147,29 +188,58 @@ def recompile(out_dir: Path, output: Path):
     if output.exists():
         output.unlink()
     subprocess.run(["apktool", "b", "-o", str(output), str(out_dir)], check=True)
+    sz = output.stat().st_size
+    print(f"  built: {fmt_size(sz)}")
 
 
 def sign_apk(input_apk: Path, ks: Path, output: Path):
     print("signing...")
     if output.exists():
         output.unlink()
-    aligned = input_apk.with_suffix(".aligned.apk")
-    subprocess.run(["zipalign", "-p", "-f", "4", str(input_apk), str(aligned)], check=True)
-    subprocess.run(
-        [
-            "apksigner", "sign",
-            "--ks", str(ks),
-            "--ks-key-alias", "earth_test",
-            "--ks-pass", "pass:earth_test",
-            "--key-pass", "pass:earth_test",
-            "--v1-signing-enabled", "true",
-            "--v2-signing-enabled", "true",
-            "--out", str(output),
-            str(aligned),
-        ],
-        check=True,
-    )
-    aligned.unlink()
+
+    if need("apksigner") and need("zipalign"):
+        print("  using apksigner + zipalign")
+        aligned = input_apk.with_suffix(".aligned.apk")
+        subprocess.run(
+            ["zipalign", "-p", "-f", "4", str(input_apk), str(aligned)],
+            check=True,
+        )
+        subprocess.run(
+            [
+                "apksigner", "sign",
+                "--ks", str(ks),
+                "--ks-key-alias", "earth_test",
+                "--ks-pass", "pass:earth_test",
+                "--key-pass", "pass:earth_test",
+                "--v1-signing-enabled", "true",
+                "--v2-signing-enabled", "true",
+                "--out", str(output),
+                str(aligned),
+            ],
+            check=True,
+        )
+        aligned.unlink()
+    elif need("jarsigner"):
+        print("  using jarsigner (v1 signing only — no zipalign/aligned)")
+        subprocess.run(
+            [
+                "jarsigner",
+                "-keystore", str(ks),
+                "-storepass", "earth_test",
+                "-keypass", "earth_test",
+                "-signedjar", str(output),
+                str(input_apk),
+                "earth_test",
+            ],
+            check=True,
+        )
+    else:
+        bail(
+            "no signing tool found — install apksigner+zipalign (Android SDK)"
+            " or jarsigner (JDK)"
+        )
+    sz = output.stat().st_size
+    print(f"  signed: {fmt_size(sz)}")
 
 
 def main():
@@ -199,10 +269,9 @@ def main():
     unsigned = work / "dev.projectearth.prod.unsigned.apk"
     signed = base / "dev.projectearth.prod.apk"
 
-    need("apktool")
-    need("git")
-    need("zipalign")
-    need("apksigner")
+    need("apktool") or bail("apktool not found — install it first")
+
+    validate_apk(apk)
 
     if not args.skip_download:
         download_patches(patch_dir)
