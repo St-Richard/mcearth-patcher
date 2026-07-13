@@ -261,23 +261,86 @@ def patch_binary(out_dir: Path, server: str):
     so.write_bytes(data)
 
 
+def patch_manifest_package(out_dir: Path):
+    """Apply package-name changes to decompiled AndroidManifest.xml directly."""
+    mf = out_dir / "AndroidManifest.xml"
+    if not mf.exists():
+        return
+    old = "com.mojang.minecraftearth"
+    new = "dev.projectearth.prod"
+    text = mf.read_text(encoding="utf-8")
+    if old not in text:
+        return
+    text = text.replace(old, new)
+    mf.write_text(text, encoding="utf-8")
+    print("  [inline] package name in AndroidManifest.xml")
+
+
+def _patch_targets(pf):
+    """Return list of target file paths from a patch (relative, no a/b prefix)."""
+    content = pf.read_bytes()
+    idx = content.find(b"diff --git")
+    if idx >= 0:
+        content = content[idx:]
+    ps = fromstring(content)
+    if not ps:
+        return []
+    targets = []
+    for item in ps.items:
+        t = item.target.decode()
+        targets.append(re.sub(r"^[ab]/", "", t))
+    return targets
+
+
 def apply_patches(out_dir: Path, patch_dir: Path):
     print("applying patches...")
     patches = sorted(patch_dir.glob("*.patch"))
     if not patches:
         print("  no patches to apply")
         return
+
+    use_git = which("git") is not None
+
+    if use_git:
+        subprocess.run(["git", "init"], cwd=out_dir,
+                       check=True, capture_output=True)
+        subprocess.run(
+            ["git", "-c", "user.name=p", "-c", "user.email=p@p",
+             "config", "user.email", "p@p"],
+            cwd=out_dir, check=True, capture_output=True,
+        )
+        subprocess.run(
+            ["git", "-c", "user.name=p", "-c", "user.email=p@p",
+             "config", "user.name", "p"],
+            cwd=out_dir, check=True, capture_output=True,
+        )
+
     for pf in patches:
+        targets = _patch_targets(pf)
+
+        # Handle AndroidManifest.xml changes inline (apktool version skew)
+        if "AndroidManifest.xml" in targets:
+            patch_manifest_package(out_dir)
+            print(f"  {pf.name} (inline)")
+            continue
+
         content = pf.read_bytes().replace(b"\r\n", b"\n").replace(b"\r", b"\n")
-        ps = fromstring(content)
-        if ps is None:
-            bail(f"failed to parse patch: {pf.name}")
-        for item in ps.items:
-            target_path = item.target.decode()
-            target_path = re.sub(r"^[ab]/", "", target_path)
-            normalize_line_endings(out_dir, target_path)
-        if not ps.apply(root=str(out_dir), strip=1):
-            bail(f"failed to apply patch: {pf.name}")
+
+        # Normalise line endings of target files
+        for t in targets:
+            normalize_line_endings(out_dir, t)
+
+        if use_git:
+            subprocess.run(
+                ["git", "apply", "--whitespace=nowarn", str(pf)],
+                cwd=out_dir, check=True,
+            )
+        else:
+            ps = fromstring(content)
+            if not ps:
+                bail(f"failed to parse patch: {pf.name}")
+            if not ps.apply(root=str(out_dir), strip=1):
+                bail(f"failed to apply patch: {pf.name}")
         print(f"  {pf.name}")
 
 
@@ -334,7 +397,7 @@ def main():
     script_dir = Path(__file__).parent
     tools_dir = script_dir / "tools"
 
-    ks = args.keystore or (script_dir / "resources" / "earth_test.jks")
+    ks = args.keystore or (script_dir / "resources" / "earth_test.p12")
     if not ks.exists():
         bail(f"keystore not found: {ks}")
 
