@@ -5,6 +5,7 @@ Patches Minecraft Earth APK to use community servers.
 """
 
 import argparse
+import base64
 import os
 import platform
 import re
@@ -13,6 +14,7 @@ import struct
 import subprocess
 import sys
 import tarfile
+import zlib
 import zipfile
 from pathlib import Path
 
@@ -276,6 +278,104 @@ def patch_manifest_package(out_dir: Path):
     print("  [inline] package name in AndroidManifest.xml")
 
 
+def _git_b85decode(data):
+    """Decode git's base85 (ascii85) encoding (RFC 1924 variant)."""
+    return base64.b85decode(data)
+
+
+def _apply_one_binary_section(out_dir, target, mode, b85_lines):
+    """Apply one literal binary section from a git binary patch."""
+    target_path = out_dir / target
+
+    if mode == "deleted":
+        if target_path.exists():
+            target_path.unlink()
+        return True
+
+    b85_chunks = []
+    for line in b85_lines:
+        line = line.strip()
+        if not line:
+            continue
+        if len(line) < 1:
+            continue
+        count = ord(line[0]) - 32
+        if count <= 0:
+            continue
+        b85_data = line[1:]
+        if len(b85_data) != count:
+            b85_data = b85_data[:count]
+        b85_chunks.append(b85_data)
+
+    if not b85_chunks:
+        return True
+
+    raw = "".join(b85_chunks)
+    compressed = _git_b85decode(raw)
+    try:
+        content = zlib.decompress(compressed)
+    except zlib.error:
+        content = zlib.decompress(compressed, -zlib.MAX_WBITS)
+
+    target_path.parent.mkdir(parents=True, exist_ok=True)
+    target_path.write_bytes(content)
+    if mode:
+        target_path.chmod(int(mode, 8))
+    return True
+
+
+def _parse_git_binary_patch(out_dir: Path, pf: Path):
+    """Apply a git binary patch that may contain multiple file sections."""
+    text = pf.read_text(encoding="utf-8", errors="replace")
+    lines = text.splitlines()
+
+    i = 0
+    while i < len(lines):
+        m = re.match(r"^diff --git a/(.+?) b/(.+?)$", lines[i])
+        if not m:
+            i += 1
+            continue
+        target = m.group(2)
+        mode = None
+        i += 1
+
+        # Skip to the binary content section
+        while i < len(lines) and not lines[i].startswith(("literal ", "delta ")):
+            rm = re.match(r"^(new|deleted) file mode (\d+)$", lines[i])
+            if rm:
+                mode = rm.group(2) if rm.group(1) == "new" else "deleted"
+            elif lines[i] == "GIT binary patch":
+                pass
+            i += 1
+
+        if i >= len(lines):
+            break
+
+        if lines[i].startswith("literal "):
+            binary_type = "literal"
+        elif lines[i].startswith("delta "):
+            binary_type = "delta"
+        else:
+            continue
+
+        i += 1  # skip "literal N" line
+
+        # Collect b85 lines until next section or end
+        b85_lines = []
+        while i < len(lines):
+            line = lines[i]
+            if line.startswith("diff --git") or line.startswith("literal ") or line.startswith("delta "):
+                break
+            b85_lines.append(line)
+            i += 1
+
+        if binary_type == "literal":
+            if not _apply_one_binary_section(out_dir, target, mode, b85_lines):
+                return False
+
+    return True
+
+
 def _patch_targets(pf):
     """Return list of target file paths from a patch (relative, no a/b prefix)."""
     content = pf.read_bytes()
@@ -299,22 +399,6 @@ def apply_patches(out_dir: Path, patch_dir: Path):
         print("  no patches to apply")
         return
 
-    use_git = which("git") is not None
-
-    if use_git:
-        subprocess.run(["git", "init"], cwd=out_dir,
-                       check=True, capture_output=True)
-        subprocess.run(
-            ["git", "-c", "user.name=p", "-c", "user.email=p@p",
-             "config", "user.email", "p@p"],
-            cwd=out_dir, check=True, capture_output=True,
-        )
-        subprocess.run(
-            ["git", "-c", "user.name=p", "-c", "user.email=p@p",
-             "config", "user.name", "p"],
-            cwd=out_dir, check=True, capture_output=True,
-        )
-
     for pf in patches:
         targets = _patch_targets(pf)
 
@@ -330,17 +414,17 @@ def apply_patches(out_dir: Path, patch_dir: Path):
         for t in targets:
             normalize_line_endings(out_dir, t)
 
-        if use_git:
-            subprocess.run(
-                ["git", "apply", "--whitespace=nowarn", str(pf)],
-                cwd=out_dir, check=True,
-            )
-        else:
-            ps = fromstring(content)
-            if not ps:
-                bail(f"failed to parse patch: {pf.name}")
-            if not ps.apply(root=str(out_dir), strip=1):
-                bail(f"failed to apply patch: {pf.name}")
+        ps = fromstring(content)
+        if not ps:
+            # Not a text patch — try git binary patch format
+            if b"GIT binary patch" in content:
+                if _parse_git_binary_patch(out_dir, pf):
+                    print(f"  {pf.name}")
+                    continue
+            bail(f"failed to parse patch: {pf.name}")
+
+        if not ps.apply(root=str(out_dir), strip=1):
+            bail(f"failed to apply patch: {pf.name}")
         print(f"  {pf.name}")
 
 

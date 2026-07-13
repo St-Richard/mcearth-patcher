@@ -5,7 +5,6 @@ Patches Minecraft Earth APK to redirect it to community-run servers.
 ## Prerequisites
 
 - **Python 3.10+** and pip
-- **git** (used internally for applying patches)
 
 Everything else (JDK 21, apktool) is auto-downloaded on first run.
 
@@ -39,7 +38,7 @@ The patched APK (`dev.projectearth.prod.apk`) is written to the current director
 2. **Download patches** — fetches the latest `.patch` files from [Project-Earth-Team/Patches](https://github.com/Project-Earth-Team/Patches)
 3. **Decompile** — runs apktool to decompile the APK
 4. **Patch binary** — writes the server address into `libgenoa.so` and fixes a sunset check
-5. **Apply patches** — applies smali and resource patches via git
+5. **Apply patches** — applies smali, resource, and binary patches
 6. **Recompile** — rebuilds the APK with apktool
 7. **Sign** — signs with jarsigner (from the bundled JDK)
 
